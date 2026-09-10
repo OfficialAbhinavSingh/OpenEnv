@@ -12,9 +12,9 @@ build-backend = "setuptools.build_meta"
 name = "openenv-sql-optim-env"
 version = "0.1.0"
 description = "SQL Query Optimization Environment for OpenEnv - execution-grounded RL with real DuckDB timing"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "openenv>=0.2.3",
+    "openenv>=0.4.1",
     "fastapi>=0.115.0",
     "pydantic>=2.0.0",
     "uvicorn>=0.24.0",
@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
     "pytest-cov>=4.0.0",
 ]
 
