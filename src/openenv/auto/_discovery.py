@@ -351,12 +351,35 @@ def _default_cache_file() -> Path:
     return root / "openenv" / "discovery_cache.json"
 
 
+def _is_trusted_stat(info: os.stat_result) -> bool:
+    """
+    Return whether the file *info* describes is safe to load.
+
+    On POSIX the file must be owned by the current user and not writable by group or
+    others, so a cache file planted by another user is ignored rather than trusted.
+
+    Args:
+        info (`os.stat_result`):
+            Metadata for the file being considered.
+
+    Returns:
+        `bool`: `True` if the file is owned by the current user and not
+        group/other-writable (always `True` on non-POSIX platforms).
+    """
+    if os.name != "posix":
+        return True
+    return info.st_uid == os.getuid() and not (
+        info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    )
+
+
 def _is_trusted_cache_file(path: Path) -> bool:
     """
     Return whether *path* is safe to load.
 
-    On POSIX the file must be owned by the current user and not writable by group or
-    others, so a cache file planted by another user is ignored rather than trusted.
+    Prefer `_open_trusted_cache`, which checks the descriptor it hands back. This
+    variant resolves the path a second time, so on its own it cannot promise that
+    the file inspected is the file later read.
 
     Args:
         path (`Path`):
@@ -369,12 +392,44 @@ def _is_trusted_cache_file(path: Path) -> bool:
     if os.name != "posix":
         return True
     try:
-        info = path.stat()
+        return _is_trusted_stat(path.stat())
     except OSError:
         return False
-    return info.st_uid == os.getuid() and not (
-        info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    )
+
+
+def _open_trusted_cache(path: Path) -> int | None:
+    """
+    Open *path* for reading and return the descriptor only if it is trustworthy.
+
+    Checking a path and then opening it are two separate resolutions, and an
+    attacker who can write in the cache directory can swap the file for a symlink
+    in between, so the file that was vetted is not the file that gets read.
+    ``O_NOFOLLOW`` refuses a symlink outright and ``fstat`` inspects the descriptor
+    itself, which makes the ownership check and the read the same object.
+
+    Args:
+        path (`Path`):
+            The cache file to open.
+
+    Returns:
+        `int` or `None`: an open read-only descriptor the caller must close, or
+        `None` if the file is missing, is a symlink, or is not owned by the
+        current user.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        # Missing, unreadable, or a symlink (ELOOP under O_NOFOLLOW).
+        return None
+    try:
+        if not _is_trusted_stat(os.fstat(fd)):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 class EnvironmentDiscovery:
@@ -449,21 +504,22 @@ class EnvironmentDiscovery:
         Returns:
             Dictionary of env_key -> EnvironmentInfo, or None if cache invalid
         """
-        if not self._cache_file.exists():
-            return None
-
         # Only trust a cache file owned by the current user. This prevents another
         # local user from planting a file that would redirect discovery (and the
-        # subsequent import_module) to attacker-controlled modules/classes.
-        if not _is_trusted_cache_file(self._cache_file):
-            logger.warning(
-                f"Ignoring discovery cache {self._cache_file}: not owned by the "
-                "current user or writable by group/others."
-            )
+        # subsequent import_module) to attacker-controlled modules/classes. The
+        # descriptor is what gets vetted and then read, so the file cannot be
+        # swapped for a symlink after the check.
+        fd = _open_trusted_cache(self._cache_file)
+        if fd is None:
+            if self._cache_file.exists():
+                logger.warning(
+                    f"Ignoring discovery cache {self._cache_file}: not owned by "
+                    "the current user, writable by group/others, or a symlink."
+                )
             return None
 
         try:
-            with open(self._cache_file, "r") as f:
+            with os.fdopen(fd, "r") as f:
                 cache_data = json.load(f)
 
             # Reconstruct EnvironmentInfo objects
@@ -489,11 +545,15 @@ class EnvironmentDiscovery:
                 cache_data[env_key] = asdict(env_info)
 
             self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._cache_file, "w") as f:
+            # Create the file owner-only rather than writing it and narrowing the
+            # mode afterwards: `open()` applies the umask, so a `chmod` after the
+            # fact leaves a window in which the cache is world-readable. Refuse to
+            # follow a symlink here too, so a planted link cannot redirect the
+            # write.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self._cache_file, flags, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(cache_data, f, indent=2)
-            # Restrict to the owner so the cache cannot be tampered with by others.
-            if os.name == "posix":
-                os.chmod(self._cache_file, 0o600)
 
         except Exception as e:
             logger.warning(f"Failed to save discovery cache: {e}")

@@ -383,6 +383,89 @@ class TestCacheSecurity:
             assert stat.S_IMODE(discovery._cache_file.stat().st_mode) == 0o600
         assert discovery._load_cache() is not None
 
+    def test_symlinked_cache_is_refused(self, tmp_path):
+        """The trust check must apply to the object actually read.
+
+        Checking the path and then opening it separately leaves a window: an
+        attacker who can write in the cache directory swaps the verified file
+        for a symlink before the read. Opening with ``O_NOFOLLOW`` and
+        inspecting the resulting descriptor closes it, so a symlink is refused
+        outright rather than followed to a file that was never checked.
+        """
+        if os.name != "posix":
+            return
+
+        target = tmp_path / "attacker.json"
+        target.write_text(
+            json.dumps(
+                {
+                    "evil": {
+                        "env_key": "evil",
+                        "name": "evil",
+                        "package_name": "openenv-evil",
+                        "version": "1.0.0",
+                        "description": "",
+                        "client_module_path": "os",
+                        "client_class_name": "system",
+                        "action_class_name": "A",
+                        "observation_class_name": "O",
+                        "default_image": "i",
+                    }
+                }
+            )
+        )
+        os.chmod(target, 0o600)
+
+        link = tmp_path / "cache.json"
+        link.symlink_to(target)
+
+        discovery = EnvironmentDiscovery()
+        discovery._cache_file = link
+        assert discovery._load_cache() is None
+
+    def test_save_does_not_rely_on_a_follow_up_chmod(self, tmp_path):
+        """The cache must be created owner-only, not widened then narrowed.
+
+        ``open()`` honours the umask, so creating the file and calling
+        ``chmod`` afterwards leaves a window in which the cache is
+        world-readable. Creating the descriptor with the mode already set
+        removes it; `os.chmod` is made to fail here so the test only passes if
+        nothing depends on it.
+        """
+        if os.name != "posix":
+            return
+
+        discovery = EnvironmentDiscovery()
+        discovery._cache_file = tmp_path / "sub" / "cache.json"
+        env = EnvironmentInfo(
+            env_key="t",
+            name="t",
+            package_name="openenv-t",
+            version="1.0.0",
+            description="",
+            client_module_path="t.client",
+            client_class_name="T",
+            action_class_name="A",
+            observation_class_name="O",
+            default_image="i",
+        )
+
+        real_umask = os.umask(0)
+        real_chmod = os.chmod
+
+        def _no_chmod(*args, **kwargs):
+            raise AssertionError("cache permissions must not depend on chmod")
+
+        os.chmod = _no_chmod
+        try:
+            discovery._save_cache({"t": env})
+        finally:
+            os.chmod = real_chmod
+            os.umask(real_umask)
+
+        assert discovery._cache_file.exists()
+        assert stat.S_IMODE(discovery._cache_file.stat().st_mode) == 0o600
+
 
 class TestGlobalDiscovery:
     """Test global discovery instance management."""
