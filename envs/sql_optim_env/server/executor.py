@@ -100,12 +100,19 @@ class QueryExecutor:
     def __init__(self) -> None:
         # Build the tables once on a writable connection to a temp file, then
         # reopen the database read-only. Every query — trusted task SQL and
-        # agent rewrites alike — runs against the read-only connection, so the
-        # DuckDB engine itself rejects any write (no keyword heuristics, and DML
-        # inside a CTE cannot slip through on any DuckDB version) and, per
-        # `_DUCKDB_CONFIG`, cannot reach the filesystem either. A lock
-        # serializes access because a single DuckDB connection is not safe for
-        # concurrent use by the server's worker pool.
+        # agent rewrites alike — runs against the read-only database, so the
+        # DuckDB engine itself rejects any *persistent* write (no keyword
+        # heuristics, and DML inside a CTE cannot slip through on any DuckDB
+        # version) and, per `_DUCKDB_CONFIG`, cannot reach the filesystem
+        # either.
+        #
+        # Read-only is not sufficient on its own: DuckDB still accepts
+        # session-scoped DDL, so `CREATE TEMP TABLE users AS ...` succeeds and
+        # shadows a base table for every later query on the same connection.
+        # Queries therefore run on a short-lived cursor (`_session`), whose
+        # temporary catalog dies with it, rather than directly on `self.conn`.
+        # A lock serializes access because a single DuckDB connection is not
+        # safe for concurrent use by the server's worker pool.
         self._dir = tempfile.mkdtemp(prefix="sql_optim_")
         self._path = os.path.join(self._dir, "sql_optim.duckdb")
         builder = duckdb.connect(self._path, config=_DUCKDB_CONFIG)
@@ -113,6 +120,9 @@ class QueryExecutor:
         builder.close()
 
         self.conn = duckdb.connect(self._path, read_only=True, config=_DUCKDB_CONFIG)
+        # Innermost-last stack of the cursors currently executing, so a deadline
+        # armed at any nesting level cancels whatever is actually running.
+        self._sessions: List[duckdb.DuckDBPyConnection] = []
         # Reentrant so `_run` can hold the lock across a whole measurement while
         # the helpers it calls still take it individually.
         self._exec_lock = threading.RLock()
@@ -197,6 +207,42 @@ class QueryExecutor:
     # ── Execution helpers ─────────────────────────────────────────────────
 
     @contextlib.contextmanager
+    def _session(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Yield a short-lived cursor to run one statement on.
+
+        `cursor()` opens another connection to the same database with its own
+        temporary catalog, so session DDL an agent smuggles in
+        (`CREATE TEMP TABLE orders AS SELECT 1`, which a read-only database
+        still permits) is discarded when the cursor closes instead of shadowing
+        a base table for every later episode in the process.
+
+        Registered on `_sessions` while it runs so `_deadline` can cancel it.
+        """
+        cursor = self.conn.cursor()
+        self._sessions.append(cursor)
+        try:
+            yield cursor
+        finally:
+            self._sessions.pop()
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    def _interrupt_active(self) -> None:
+        """Cancel the innermost running session, if any.
+
+        Resolved when the timer fires rather than when it is armed, so a
+        deadline set around a whole measurement still cancels the individual
+        statement that a helper is running underneath it.
+        """
+        target = self._sessions[-1] if self._sessions else self.conn
+        try:
+            target.interrupt()
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
     def _deadline(self) -> Iterator[None]:
         """Cancel whatever is running on the connection after the time limit.
 
@@ -220,7 +266,7 @@ class QueryExecutor:
         Callers must not treat the interrupt as a reason to try a different
         strategy: the timer has already fired, so a retry would run unbounded.
         """
-        timer = threading.Timer(_QUERY_TIMEOUT_S, self.conn.interrupt)
+        timer = threading.Timer(_QUERY_TIMEOUT_S, self._interrupt_active)
         timer.daemon = True
         timer.start()
         try:
@@ -241,13 +287,10 @@ class QueryExecutor:
         ``;``) still surfaces as a DuckDB error exactly as before.
         """
         try:
-            with self._exec_lock, self._deadline():
-                # `execute()` returns the connection itself, so the leftover rows
-                # of an over-cap result cannot be released with a `close()`
-                # (that would close the shared read-only connection). The next
-                # statement on the connection supersedes the pending result,
-                # and every caller issues one straight after.
-                head = self.conn.execute(query).fetchmany(_MAX_MATERIALIZED_ROWS + 1)
+            with self._exec_lock, self._session() as cur, self._deadline():
+                # The leftover rows of an over-cap result are released when the
+                # session closes, so nothing stays pending on `self.conn`.
+                head = cur.execute(query).fetchmany(_MAX_MATERIALIZED_ROWS + 1)
         except duckdb.InterruptException:
             return None, _TIMEOUT_ERROR
         except Exception as exc:
@@ -265,9 +308,9 @@ class QueryExecutor:
         just ran out of time.
         """
         try:
-            with self._exec_lock, self._deadline():
+            with self._exec_lock, self._session() as cur, self._deadline():
                 return (
-                    self.conn.execute(_as_subquery(query, "COUNT(*)")).fetchone()[0],
+                    cur.execute(_as_subquery(query, "COUNT(*)")).fetchone()[0],
                     None,
                 )
         except duckdb.InterruptException:
@@ -277,10 +320,10 @@ class QueryExecutor:
 
         try:
             count = 0
-            with self._exec_lock, self._deadline():
-                cursor = self.conn.execute(query)
+            with self._exec_lock, self._session() as cur, self._deadline():
+                result = cur.execute(query)
                 while True:
-                    batch = cursor.fetchmany(_FETCH_BATCH)
+                    batch = result.fetchmany(_FETCH_BATCH)
                     if not batch:
                         break
                     count += len(batch)
@@ -305,8 +348,8 @@ class QueryExecutor:
         timings: List[float] = []
         for _ in range(runs):
             try:
-                with self._exec_lock, self._deadline():
-                    rows = self.conn.execute(f"EXPLAIN ANALYZE {query}").fetchall()
+                with self._exec_lock, self._session() as cur, self._deadline():
+                    rows = cur.execute(f"EXPLAIN ANALYZE {query}").fetchall()
             except duckdb.InterruptException:
                 raise
             except Exception:
@@ -330,10 +373,10 @@ class QueryExecutor:
         timings: List[float] = []
         for _ in range(runs):
             try:
-                with self._exec_lock, self._deadline():
+                with self._exec_lock, self._session() as cur, self._deadline():
                     t0 = time.perf_counter()
-                    cursor = self.conn.execute(query)
-                    while cursor.fetchmany(_FETCH_BATCH):
+                    result = cur.execute(query)
+                    while result.fetchmany(_FETCH_BATCH):
                         pass
                     timings.append((time.perf_counter() - t0) * 1000.0)
             except duckdb.InterruptException:
@@ -399,7 +442,10 @@ class QueryExecutor:
         function, but not past the shared deadline: once a strategy has timed
         out, the cheaper ones would time out too.
         """
-        with self._exec_lock, self._deadline():
+        with self._exec_lock, self._session() as cur, self._deadline():
+            # One session spans every fallback strategy, so they share the
+            # deadline as before and a strategy that errors leaves nothing
+            # behind for the next one.
             # Try BIT_XOR of a numeric hash (portable across DuckDB versions)
             selects = [
                 # Option 1: BIT_XOR of md5 prefix cast to integer
@@ -415,7 +461,7 @@ class QueryExecutor:
             error: Optional[str] = None
             for select in selects:
                 try:
-                    result = self.conn.execute(_as_subquery(query, select)).fetchone()
+                    result = cur.execute(_as_subquery(query, select)).fetchone()
                     return result[0], result[1], None
                 except duckdb.InterruptException:
                     return None, None, _TIMEOUT_ERROR
@@ -527,10 +573,8 @@ class QueryExecutor:
         so it runs under the same deadline as everything else.
         """
         try:
-            with self._exec_lock, self._deadline():
-                rows = self.conn.execute(
-                    f"EXPLAIN {_strip_terminators(query)}"
-                ).fetchall()
+            with self._exec_lock, self._session() as cur, self._deadline():
+                rows = cur.execute(f"EXPLAIN {_strip_terminators(query)}").fetchall()
             return "\n".join(str(r[1]) for r in rows)
         except duckdb.InterruptException:
             return f"EXPLAIN error: {_TIMEOUT_ERROR}"
@@ -542,9 +586,9 @@ class QueryExecutor:
         tables = ["users", "orders", "products", "events"]
         # No deadline: these are fixed, trusted queries, so arming one would only
         # add a window in which a stray interrupt could cancel them.
-        with self._exec_lock:
+        with self._exec_lock, self._session() as cur:
             return {
-                t: self.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                t: cur.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                 for t in tables
             }
 

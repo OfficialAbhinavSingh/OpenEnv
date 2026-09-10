@@ -685,3 +685,73 @@ class TestLargeResultMeasurement:
             assert result["optimized_ms"] >= _MIN_MEASURABLE_MS
             assert result["speedup"] > 0
             assert result["results_match"] is True
+
+
+class TestSessionIsolation:
+    """Agent SQL must not leave objects behind on the executor's connection.
+
+    A read-only DuckDB connection rejects persistent writes, but it still
+    accepts session-scoped DDL: `CREATE TEMP TABLE users AS ...` succeeds and
+    shadows the base table for every later query on that same connection. On a
+    long-lived server that poisons all subsequent episodes, and it is directly
+    reward-hacking: shrink `orders` to one row and the "optimized" rewrite is
+    both instant and, because the original runs against the same shadowed
+    table, still "correct".
+    """
+
+    def test_temp_table_cannot_shadow_a_base_table(self, executor):
+        baseline = executor.table_stats["users"]
+
+        executor.compare(
+            "SELECT COUNT(*) FROM users",
+            "CREATE TEMP TABLE users AS SELECT 1 AS id, 'HIJACKED' AS name",
+        )
+
+        assert executor.table_stats["users"] == baseline
+        rows, error = executor._probe("SELECT COUNT(*) FROM users")
+        assert error is None
+        assert rows[0][0] == baseline
+
+    def test_a_shadowed_table_cannot_fake_a_later_episode(self, executor):
+        """The reward-hacking path: poison once, then grade a later rewrite.
+
+        The row count is hardcoded rather than read back from the executor: a
+        leaked shadow table would corrupt that reading too, and the assertion
+        would pass against the poisoned value.
+        """
+        true_rows = 10_000  # `users` seed size, see `_build_tables`
+
+        executor.compare(
+            "SELECT COUNT(*) FROM users",
+            "CREATE TEMP TABLE users AS SELECT 1 AS id, 'HIJACKED' AS name",
+        )
+        result = executor.compare("SELECT * FROM users", "SELECT * FROM users")
+
+        assert result["original_error"] is None
+        assert result["original_rows"] == true_rows
+        assert result["optimized_rows"] == true_rows
+
+    def test_ddl_submitted_as_a_rewrite_is_never_credited(self, executor):
+        """DDL is not an error any more, and does not need to be.
+
+        Before sessions were isolated, DDL surfaced as an error only by
+        accident: the temp table survived the first timing run, so the second
+        collided with it. Now each run gets a clean catalog and the statement
+        simply succeeds. That is harmless, because the grader gates speedup
+        credit on `results_match`, and a `CREATE` returns a row count rather
+        than the query's rows.
+        """
+        info = executor.compare(
+            "SELECT COUNT(*) FROM users",
+            "CREATE TEMP TABLE scratch_pad AS SELECT 1",
+        )
+        assert not info["results_match"]
+
+    def test_the_same_temp_name_can_be_reused_across_queries(self, executor):
+        """No residue: a name is free again once its session ends."""
+        for _ in range(3):
+            info = executor.compare(
+                "SELECT COUNT(*) FROM users",
+                "CREATE TEMP TABLE scratch_pad AS SELECT 1",
+            )
+            assert info["optimized_error"] is None
