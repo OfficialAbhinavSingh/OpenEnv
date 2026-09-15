@@ -53,7 +53,11 @@ class SQLOptimObservation(Observation):
     Observation returned to the agent after `reset` and each `step`.
 
     Inherits `done`, `reward`, and `metadata` from
-    [`~openenv.core.env_server.Observation`]. The composite reward breakdown,
+    [`~openenv.core.env_server.Observation`]. The serializer carries `reward`
+    and `done` on the response envelope rather than in the observation payload;
+    the typed client mirrors them back, so `observation.reward` and
+    `StepResult.reward` agree after a step. `reset` leaves `reward` as `None`,
+    since nothing has been scored yet. The composite reward breakdown,
     per-criterion feedback, and full execution comparison are attached under
     `metadata` (keys `reward_breakdown`, `feedback`, `execution`).
 

@@ -59,11 +59,20 @@ class SQLOptimEnv(EnvClient[SQLOptimAction, SQLOptimObservation, SQLOptimState])
     def _parse_result(self, payload: Dict[str, Any]) -> StepResult[SQLOptimObservation]:
         """Parse a server step/reset response into a `StepResult`."""
         obs_data = payload.get("observation", {})
-        observation = SQLOptimObservation(**obs_data)
+        # `serialize_observation` keeps reward and done on the envelope rather
+        # than in the observation dict, so mirror them back onto the
+        # observation. Without this `result.observation.reward` stayed None and
+        # `result.observation.done` False while `StepResult` carried the right
+        # values, trapping callers that read the observation instead.
+        reward = payload.get("reward", obs_data.get("reward"))
+        done = bool(payload.get("done", obs_data.get("done", False)))
+        observation = SQLOptimObservation(
+            **{**obs_data, "reward": reward, "done": done}
+        )
         return StepResult(
             observation=observation,
-            reward=payload.get("reward", observation.reward),
-            done=payload.get("done", observation.done),
+            reward=reward,
+            done=done,
             metadata=payload.get("metadata", observation.metadata),
         )
 
