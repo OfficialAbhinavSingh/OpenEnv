@@ -34,6 +34,9 @@ _lock = threading.Lock()
 # memory. The cap matches the threshold `compare()` already used to pick the
 # precise row-by-row comparison, so behaviour for small results is unchanged.
 _MAX_MATERIALIZED_ROWS = 50_000
+# An `EXPLAIN ANALYZE` plan is a couple of rows; this only exists so the plan
+# fetch can never become an unbounded materialization of agent-chosen data.
+_MAX_PLAN_ROWS = 2_000
 _FETCH_BATCH = 10_000
 _TIMING_RUNS = 3
 # `EXPLAIN ANALYZE` prints seconds with four decimals, so 0.1 ms is the smallest
@@ -88,6 +91,41 @@ def _as_subquery(query: str, select: str) -> str:
     parse error, which used to cost the checksum its result.
     """
     return f"SELECT {select} FROM (\n{query}\n) t"
+
+
+def _single_statement_error(query: str) -> Optional[str]:
+    """
+    Return an error string if *query* is not exactly one SQL statement.
+
+    Agent SQL gets `EXPLAIN ANALYZE ` prefixed onto it for timing. A prefix only
+    binds to the first statement, so `SELECT 1; SELECT * FROM events` leaves the
+    real query running as a statement of its own and the plan fetch returns its
+    whole result set, past `_MAX_MATERIALIZED_ROWS`. The deadline does not save
+    us there, because `interrupt()` cannot stop rows that are already being
+    converted into Python objects.
+
+    DuckDB's own parser decides what counts as a statement, so a `;` inside a
+    string literal, a leading `--` comment and a trailing terminator all stay
+    valid. That is the part an earlier keyword-scanning pre-check got wrong.
+
+    Args:
+        query (`str`):
+            The SQL to inspect.
+
+    Returns:
+        `str` or `None`: an error message, or `None` when the query is a single
+        statement. A query DuckDB cannot parse is reported as its parse error.
+    """
+    try:
+        statements = duckdb.extract_statements(query)
+    except Exception as exc:
+        return str(exc)
+    if len(statements) != 1:
+        return (
+            f"Expected a single SQL statement, got {len(statements)}. "
+            "Submit one query, without a second statement after `;`."
+        )
+    return None
 
 
 class QueryExecutor:
@@ -284,8 +322,14 @@ class QueryExecutor:
 
         This is also the authoritative error check: the query runs unwrapped on
         the read-only connection, so a write (DDL/DML, inside a CTE, or after a
-        ``;``) still surfaces as a DuckDB error exactly as before.
+        ``;``) still surfaces as a DuckDB error exactly as before. Multi-statement
+        input is rejected here, before anything executes, because ``_run`` stops
+        on this error and so never reaches the plan fetch it would abuse.
         """
+        error = _single_statement_error(query)
+        if error is not None:
+            return None, error
+
         try:
             with self._exec_lock, self._session() as cur, self._deadline():
                 # The leftover rows of an over-cap result are released when the
@@ -349,7 +393,11 @@ class QueryExecutor:
         for _ in range(runs):
             try:
                 with self._exec_lock, self._session() as cur, self._deadline():
-                    rows = cur.execute(f"EXPLAIN ANALYZE {query}").fetchall()
+                    # Bounded on purpose: a plan is tiny, so anything larger is
+                    # not a plan and must not be pulled into Python wholesale.
+                    rows = cur.execute(f"EXPLAIN ANALYZE {query}").fetchmany(
+                        _MAX_PLAN_ROWS
+                    )
             except duckdb.InterruptException:
                 raise
             except Exception:
@@ -572,6 +620,10 @@ class QueryExecutor:
         Plain ``EXPLAIN`` only plans the query, but it is still agent-authored,
         so it runs under the same deadline as everything else.
         """
+        error = _single_statement_error(_strip_terminators(query))
+        if error is not None:
+            return f"EXPLAIN error: {error}"
+
         try:
             with self._exec_lock, self._session() as cur, self._deadline():
                 rows = cur.execute(f"EXPLAIN {_strip_terminators(query)}").fetchall()

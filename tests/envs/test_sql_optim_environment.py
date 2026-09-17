@@ -755,3 +755,56 @@ class TestSessionIsolation:
                 "CREATE TEMP TABLE scratch_pad AS SELECT 1",
             )
             assert info["optimized_error"] is None
+
+
+class TestSingleStatement:
+    """Agent SQL must be one statement, checked by DuckDB's own parser.
+
+    `_engine_ms` prefixes `EXPLAIN ANALYZE ` onto the agent's query. A second
+    statement after a `;` survives that prefix, so DuckDB runs the real query
+    as its own statement and the plan fetch returns the whole result set
+    instead of a plan, bypassing `_MAX_MATERIALIZED_ROWS`. Timing out does not
+    help: `interrupt()` cannot stop rows already being converted into Python
+    objects, and the lock is held throughout.
+
+    The check uses `duckdb.extract_statements` rather than scanning for `;`,
+    so comments and semicolons inside string literals do not false-reject the
+    way an earlier keyword pre-check did.
+    """
+
+    def test_a_second_statement_is_rejected(self, executor):
+        info = executor.compare(
+            "SELECT id FROM events WHERE user_id = 42",
+            "SELECT 1; SELECT * FROM events",
+        )
+        assert info["optimized_error"] is not None
+        assert not info["results_match"]
+
+    def test_rejection_is_cheap(self, executor):
+        """Rejecting must not first materialize the hidden result set."""
+        import tracemalloc
+
+        tracemalloc.start()
+        executor.compare(
+            "SELECT id FROM events WHERE user_id = 42",
+            "SELECT 1; SELECT * FROM events",
+        )
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        assert peak < 50_000_000, f"peaked at {peak / 1e6:.0f} MB"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "-- leading comment\nSELECT id FROM events WHERE user_id = 42",
+            "/* block */ SELECT id FROM events WHERE user_id = 42",
+            "SELECT id, ';' AS semi FROM events WHERE user_id = 42",
+            "SELECT id FROM events WHERE user_id = 42;",
+        ],
+    )
+    def test_legitimate_rewrites_are_not_rejected(self, executor, query):
+        """Comments, string-literal semicolons and a trailing `;` stay valid."""
+        info = executor.compare("SELECT id FROM events WHERE user_id = 42", query)
+
+        assert info["optimized_error"] is None
