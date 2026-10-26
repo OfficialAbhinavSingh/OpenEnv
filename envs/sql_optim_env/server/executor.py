@@ -57,14 +57,16 @@ _TOTAL_TIME_RE = re.compile(r"Total Time:\s*([0-9]*\.?[0-9]+)\s*s")
 # rewrite like `FROM events a, events b` is a trillion-row cross join: without
 # a ceiling it can exhaust memory, fill the spill directory, and hold the
 # execution lock for hours while every other session waits behind it. DuckDB has
-# no statement-timeout option, so the limits below bound memory and spill space
-# and `_deadline()` bounds time.
+# no statement-timeout option. These caps cover buffer-managed memory and spill
+# only; Python conversion and other allocations still need process isolation.
+# Keep headroom in the 1024 MiB manifest budget, including RAM-backed /tmp in
+# docker-local validation. `_deadline()` interrupts engine work, not Python.
 _DUCKDB_CONFIG = {
     "threads": "2",
     "enable_external_access": "false",
     "lock_configuration": "true",
-    "memory_limit": "1GB",
-    "max_temp_directory_size": "1GB",
+    "memory_limit": "256MiB",
+    "max_temp_directory_size": "128MiB",
 }
 # Generous next to the real tasks (the slowest is ~0.6s) and short enough that a
 # runaway rewrite cannot wedge the server.

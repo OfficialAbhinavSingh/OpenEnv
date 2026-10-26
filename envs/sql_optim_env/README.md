@@ -19,7 +19,7 @@ tags:
 An **execution-grounded** environment for training agents to write fast SQL. The
 agent is given a slow query plus its schema and must return a rewrite. Reward is
 **not** a keyword heuristic: the environment runs both the original and the
-optimized query against a real in-memory **DuckDB** database seeded with
+optimized query against a real temporary-file-backed **DuckDB** database seeded with
 realistic synthetic data (10k users, 500k orders, 1k products, 1M events), then
 scores the agent on measured speedup and result-correctness.
 
@@ -102,6 +102,30 @@ functions, spanning `easy` → `expert`.
 ```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
+
+## Resource budgets
+
+`openenv.yaml` declares 1024 MiB memory and 1024 MiB writable storage for
+Docker validation. DuckDB uses a **256 MiB** `memory_limit` and a **128 MiB**
+`max_temp_directory_size`, for both dataset construction and query execution.
+Explicit `MiB` units avoid confusion with DuckDB's decimal `GB`.
+
+The `docker-local` validation provider enforces the memory limit with swap
+disabled and splits writable storage between `/tmp` tmpfs and `/dev/shm`
+(up to 64 MiB). The temporary database and spill files in `/tmp` therefore
+also consume container memory. A regression checks the real seeded database,
+spill allowance and shared-memory allowance plus DuckDB's memory cap fit in
+half the declared memory budget, leaving at least 512 MiB for runtime overhead.
+This is budget headroom, not a guarantee that every agent query fits.
+
+DuckDB's [memory limit covers its buffer manager](https://duckdb.org/docs/current/operations_manual/limits),
+not the Python heap or every DuckDB allocation. Its spill cap excludes the
+base database. The result-fetch row cap is not a byte cap, and the interrupt
+deadline cannot stop Python object conversion. Untrusted workloads still need
+external process/container memory and time enforcement; the resource-isolation
+policy remains a maintainer review gate. The Dockerfile and a direct `uvicorn`
+launch do not enforce the YAML budgets themselves: deployments must configure
+their runtime limits explicitly.
 
 ## Tests
 

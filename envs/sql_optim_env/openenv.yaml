@@ -12,6 +12,8 @@ validation:
     floor_margin: 0.5
   resources:
     cpu: 2.0
+    # docker-local uses MiB; /tmp database and spill files also consume memory.
+    # DuckDB caps: 256 MiB buffer memory + 128 MiB spill; see README.
     memory_mb: 1024
     disk_mb: 1024
     episode_timeout_s: 120.0

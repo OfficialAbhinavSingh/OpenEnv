@@ -580,19 +580,39 @@ class TestResourceLimits:
             "events": 1_000_000,
         }
 
-    def test_memory_and_spill_limits_are_applied(self, executor):
-        """The limits are accepted by DuckDB, not silently ignored."""
-        from envs.sql_optim_env.server.executor import _DUCKDB_CONFIG
+    def test_memory_and_spill_leave_runtime_headroom(self, executor):
+        """Include tmpfs-backed spill and the real seed DB in the memory budget."""
+        from pathlib import Path
 
-        assert "memory_limit" in _DUCKDB_CONFIG
-        assert "max_temp_directory_size" in _DUCKDB_CONFIG
+        import yaml
+
+        manifest = (
+            Path(__file__).resolve().parents[2] / "envs/sql_optim_env/openenv.yaml"
+        )
+        resources = yaml.safe_load(manifest.read_text())["validation"]["resources"]
+        mib = 1024 * 1024
+        limits = {}
         for option in ("memory_limit", "max_temp_directory_size"):
             with executor._exec_lock:
                 value = executor.conn.execute(
                     f"SELECT current_setting('{option}')"
                 ).fetchone()[0]
-            # A bounded size, not DuckDB's default of most of the machine.
-            assert "GiB" in value or "MiB" in value, (option, value)
+            amount, unit = value.split()
+            limits[option] = float(amount) * {"MiB": mib, "GiB": 1024 * mib}[unit]
+
+        # docker-local puts /tmp on tmpfs and reserves up to 64 MiB for /dev/shm.
+        database_bytes = sum(
+            p.stat().st_size for p in Path(executor._dir).rglob("*") if p.is_file()
+        )
+        disk_bytes = resources["disk_mb"] * mib
+        shm_bytes = min(64 * mib, disk_bytes // 2)
+        writable_bytes = limits["max_temp_directory_size"] + database_bytes + shm_bytes
+        assert database_bytes > 0
+        assert writable_bytes <= disk_bytes / 2
+        # Reserve at least half for Python, unmanaged DuckDB allocations and server.
+        assert (
+            limits["memory_limit"] + writable_bytes <= resources["memory_mb"] * mib / 2
+        )
 
 
 class TestLargeResultMeasurement:
