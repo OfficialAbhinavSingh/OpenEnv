@@ -195,7 +195,7 @@ class TestClientParsing:
 class TestExecutionSafetyAndCorrectness:
     """Regression tests for the execution-engine review findings.
 
-    Cover DB isolation, checksum robustness, single-compare-per-step, stale
+    Cover DB isolation, correctness-check robustness, single-compare-per-step, stale
     execution on empty rewrites, and the task-definition corrections.
     """
 
@@ -221,8 +221,8 @@ class TestExecutionSafetyAndCorrectness:
         assert res["results_match"] is True
 
     def test_trailing_semicolon_large_result_checksum(self, executor):
-        """A `;`-terminated query over >50k rows uses the checksum path correctly."""
-        q = "SELECT * FROM events;"  # 1M rows -> checksum branch, trailing ';'
+        """A `;`-terminated query over >50k rows is still compared correctly."""
+        q = "SELECT * FROM events;"  # 1M rows, trailing ';'
         res = executor.compare(q, q)
         assert res["results_match"] is True
         assert res["original_rows"] == 1_000_000
@@ -448,10 +448,10 @@ class TestSandboxAndCorrectnessCredit:
     def test_trailing_comment_does_not_break_the_large_result_checksum(self, executor):
         """A rewrite ending in `--` still gets a real correctness verdict.
 
-        The checksum wraps the query in a subquery; on one line, a trailing
-        comment swallowed the closing paren, the checksum failed, and equal row
-        counts were then reported as a match — full correctness credit for a
-        rewrite returning different rows on every one of a million of them.
+        The correctness check wraps the query; on one line, a trailing comment
+        swallowed the closing paren. When the old checksum failed that way,
+        equal row counts were reported as a match — full correctness credit for
+        a rewrite returning different rows on every one of a million of them.
         """
         differing = executor.compare(
             "SELECT id FROM events -- keep",
@@ -468,18 +468,29 @@ class TestSandboxAndCorrectnessCredit:
     def test_unverifiable_large_result_earns_no_correctness_credit(
         self, executor, monkeypatch
     ):
-        """With no usable checksum, equal row counts are not treated as a match."""
-        monkeypatch.setattr(
-            executor, "_checksum", lambda query: (None, None, "checksum unavailable")
-        )
-        res = executor.compare(
-            "SELECT id FROM events", "SELECT id + 1 AS id FROM events"
-        )
+        """A comparison that errors is a mismatch, and is not retried another way.
+
+        Equal row counts are not evidence of equal data, so a failed comparison
+        must not fall back to them, or to any other strategy.
+        """
+        from envs.sql_optim_env.server import executor as ex_mod
+
+        calls = []
+
+        def broken(original, optimized):
+            calls.append((original, optimized))
+            return "SELECT * FRM nowhere"
+
+        monkeypatch.setattr(ex_mod, "_symmetric_difference_sql", broken)
+        res = executor.compare("SELECT id FROM events", "SELECT id FROM events")
         assert res["original_rows"] == res["optimized_rows"] == 1_000_000
+        assert res["original_error"] is None and res["optimized_error"] is None
         assert res["results_match"] is False
+        assert len(calls) == 1
 
         monkeypatch.undo()  # the executor fixture is module-scoped: restore it
-        assert executor._checksum("SELECT id FROM events")[1] is not None
+        res = executor.compare("SELECT id FROM events", "SELECT id FROM events")
+        assert res["results_match"] is True
 
 
 class TestResourceLimits:
@@ -619,7 +630,7 @@ class TestLargeResultMeasurement:
     """Large result sets are measured without being pulled into Python.
 
     Timing comes from DuckDB's profiler and correctness from the in-engine
-    checksum, so a million-row query neither buys a million Python tuples nor
+    comparison, so a million-row query neither buys a million Python tuples nor
     reports the cost of building them as its execution time.
     """
 
@@ -632,7 +643,7 @@ class TestLargeResultMeasurement:
         assert ms < 90_000  # a real measurement, not the error sentinel
 
     def test_small_result_is_still_compared_row_by_row(self, executor):
-        """Below the cap, rows are materialized and compared precisely."""
+        """Below the cap, rows are materialized and still compared precisely."""
         ms, count, rows, err = executor._run("SELECT * FROM products")
         assert err is None
         assert count == 1_000
@@ -871,3 +882,227 @@ def test_expired_deadline_finishes_before_releasing_execution_lock(
         finish_interrupt.set()
         worker.join(2)
     assert released.is_set()
+
+
+class TestExactComparison:
+    """`results_match` follows one exact equality rule at every result size.
+
+    Same output schema by position (column count, ASCII case-insensitive names,
+    identical DuckDB types), then the same rows as a multiset under DuckDB's own
+    value equality, with no float tolerance. The old comparator compared row
+    strings below 50k rows and a row-hash fingerprint above, which disagreed
+    with each other: `1 AS x` vs `'1' AS x` was rejected for 2 rows and
+    accepted for 50,002, and renaming the column did the reverse.
+    """
+
+    RUNAWAY = "SELECT COUNT(*) FROM events a, events b"
+
+    @pytest.fixture
+    def deadline(self, monkeypatch):
+        """Set the executor deadline to a given number of seconds."""
+        from envs.sql_optim_env.server import executor as ex_mod
+
+        def set_deadline(seconds):
+            monkeypatch.setattr(ex_mod, "_QUERY_TIMEOUT_S", seconds)
+
+        return set_deadline
+
+    @pytest.mark.parametrize("rows", [2, 50_002])
+    @pytest.mark.parametrize(
+        "original, rewritten, expected",
+        [
+            # Lossy coercions a bare set operation would accept.
+            ("9007199254740993::BIGINT AS x", "9007199254740992::DOUBLE AS x", False),
+            ("true AS x", "1 AS x", False),
+            ("1 AS x", "'1' AS x", False),
+            # Names: compared by position, ASCII-only case folding.
+            ("1 AS x", "1 AS y", False),
+            ("1 AS X", "1 AS x", True),
+            ('1 AS "Ä"', '1 AS "ä"', False),
+            ("1 AS x, 2 AS x", "1 AS x, 2 AS x_1", False),
+            ("1 AS x, 2 AS x", "1 AS x, 2 AS x", True),
+            ("1 AS x, 2 AS y", "2 AS y, 1 AS x", False),
+            # Types: DuckDB's canonical type strings, compared exactly.
+            ("1::INT4 AS x", "1::INTEGER AS x", True),
+            ("[1]::INT4[] AS x", "[1]::INTEGER[] AS x", True),
+            (
+                "{'A': 1}::STRUCT(A INTEGER) AS x",
+                "{'a': 1}::STRUCT(a INTEGER) AS x",
+                False,
+            ),
+            ("1.5::DECIMAL(5,1) AS x", "1.50::DECIMAL(5,2) AS x", False),
+            ("1.5::DECIMAL(5,1) AS x", "1.5::DECIMAL(6,1) AS x", False),
+            # Values: engine equality, no float tolerance.
+            ("-0.0::DOUBLE AS x", "0.0::DOUBLE AS x", True),
+            ("'nan'::DOUBLE AS x", "'nan'::DOUBLE AS x", True),
+            ("NULL::INTEGER AS x", "NULL::INTEGER AS x", True),
+            ("0.1::DOUBLE + 0.2::DOUBLE AS x", "0.3::DOUBLE AS x", False),
+            # Engine equality, not representation identity.
+            ("INTERVAL '1 month' AS x", "INTERVAL '30 days' AS x", True),
+        ],
+    )
+    def test_equality_rule_is_the_same_on_both_sides_of_50k(
+        self, executor, rows, original, rewritten, expected
+    ):
+        res = executor.compare(
+            f"SELECT {original} FROM range({rows})",
+            f"SELECT {rewritten} FROM range({rows})",
+        )
+        assert res["original_error"] is None and res["optimized_error"] is None
+        assert res["original_rows"] == res["optimized_rows"] == rows
+        assert res["results_match"] is expected
+
+    @pytest.mark.parametrize(
+        "rewritten, expected",
+        [
+            ("SELECT 1 AS x WHERE false", True),
+            ("SELECT 1 AS X WHERE false", True),
+            ("SELECT '1' AS x WHERE false", False),
+            ("SELECT 1 AS y WHERE false", False),
+            ("SELECT 1 AS x, 2 AS y WHERE false", False),
+        ],
+    )
+    def test_empty_results_still_need_matching_schemas(
+        self, executor, rewritten, expected
+    ):
+        res = executor.compare("SELECT 1 AS x WHERE false", rewritten)
+        assert res["original_rows"] == res["optimized_rows"] == 0
+        assert res["results_match"] is expected
+
+    @pytest.mark.parametrize(
+        "original, rewritten, expected",
+        [
+            (
+                "SELECT x FROM (VALUES (1), (1), (2)) t(x)",
+                "SELECT x FROM (VALUES (2), (1), (1)) t(x)",
+                True,
+            ),
+            (
+                "SELECT x FROM (VALUES (1), (1), (2)) t(x)",
+                "SELECT x FROM (VALUES (1), (2), (2)) t(x)",
+                False,
+            ),
+            # Above 50k: the same multiset in a different order, then the same
+            # values with one row moved from the 0s to the 1s.
+            (
+                "SELECT i % 2 AS x FROM range(50002) t(i)",
+                "SELECT (i + 1) % 2 AS x FROM range(50002) t(i)",
+                True,
+            ),
+            (
+                "SELECT i % 2 AS x FROM range(50002) t(i)",
+                "SELECT CASE WHEN i = 0 THEN 1 ELSE i % 2 END AS x "
+                "FROM range(50002) t(i)",
+                False,
+            ),
+        ],
+    )
+    def test_duplicate_multiplicity_counts_and_order_does_not(
+        self, executor, original, rewritten, expected
+    ):
+        assert executor.compare(original, rewritten)["results_match"] is expected
+
+    def test_each_operand_is_materialized_once(self, executor):
+        """Both `EXCEPT ALL` arms read one evaluation of each query."""
+        from envs.sql_optim_env.server.executor import _symmetric_difference_sql
+
+        sql = _symmetric_difference_sql("SELECT id FROM users", "SELECT id FROM orders")
+        with executor._exec_lock, executor._session() as cur:
+            plan = "\n".join(
+                str(r[1]) for r in cur.execute(f"EXPLAIN {sql}").fetchall()
+            )
+        # One base-table scan per query, read by two CTE scans each.
+        assert plan.count("SEQ_SCAN") == 2
+        assert plan.count("CTE_SCAN") == 4
+
+    def test_a_rewrite_cannot_read_the_comparison_ctes(self, executor):
+        """Naming the original's CTE fails on its own, so it never matches."""
+        rewrite = "SELECT * FROM __sql_optim_original"
+        res = executor.compare("SELECT id FROM users", rewrite)
+        assert res["optimized_error"] is not None
+        assert res["results_match"] is False
+        assert executor._results_equal("SELECT id FROM users", rewrite) is False
+
+    def test_multiple_statements_are_rejected_before_comparing(self, executor):
+        assert (
+            executor._results_equal("SELECT 1 AS x", "SELECT 1 AS x; SELECT 2") is False
+        )
+
+    def test_expired_deadline_keeps_interrupting_between_statements(
+        self, executor, deadline
+    ):
+        """An interrupt on an idle connection is not remembered, so it is re-sent.
+
+        With a single timer, a deadline that expired between two statements let
+        the second one run unbounded.
+        """
+        import duckdb
+
+        deadline(0.01)
+        start = time.perf_counter()
+        with executor._exec_lock, executor._session() as cur:
+            with executor._deadline() as expired:
+                cur.execute("DESCRIBE SELECT 1").fetchall()
+                time.sleep(0.05)  # idle while the deadline passes
+                assert expired()
+                with pytest.raises(duckdb.InterruptException):
+                    cur.execute(self.RUNAWAY).fetchone()
+        assert time.perf_counter() - start < 30
+
+    def test_interruption_during_materialization_then_recovery(
+        self, executor, deadline
+    ):
+        """A runaway comparison is cancelled, and the next session works."""
+        deadline(1.0)
+        start = time.perf_counter()
+        assert executor._results_equal(self.RUNAWAY, self.RUNAWAY) is False
+        assert time.perf_counter() - start < 30
+
+        assert executor._results_equal("SELECT 1 AS x", "SELECT 1 AS x") is True
+        assert executor.table_stats["events"] == 1_000_000
+
+    def test_expiry_between_stages_stops_the_comparison(
+        self, executor, deadline, monkeypatch
+    ):
+        """Schema inspection outlives the deadline: no comparison, no credit."""
+        from envs.sql_optim_env.server import executor as ex_mod
+
+        compared = []
+        real_schema = ex_mod.QueryExecutor._output_schema
+
+        def slow_schema(cur, query):
+            schema = real_schema(cur, query)
+            time.sleep(0.3)
+            return schema
+
+        def recording(original, optimized):
+            compared.append(True)
+            return "SELECT 0"
+
+        deadline(0.1)
+        monkeypatch.setattr(executor, "_output_schema", slow_schema)
+        monkeypatch.setattr(ex_mod, "_symmetric_difference_sql", recording)
+        assert executor._results_equal("SELECT 1 AS x", "SELECT 1 AS x") is False
+        assert compared == []
+
+    def test_expiry_during_comparison_earns_no_credit(
+        self, executor, deadline, monkeypatch
+    ):
+        """A comparison that completes after the deadline is not trusted."""
+        from envs.sql_optim_env.server import executor as ex_mod
+
+        real_sql = ex_mod._symmetric_difference_sql
+
+        def slow_sql(original, optimized):
+            time.sleep(0.3)  # the deadline passes after the last pre-stage check
+            return real_sql(original, optimized)
+
+        deadline(0.1)
+        # No interrupt lands, so the statement itself completes with a match.
+        monkeypatch.setattr(executor, "_interrupt_active", lambda: None)
+        monkeypatch.setattr(ex_mod, "_symmetric_difference_sql", slow_sql)
+        assert executor._results_equal("SELECT 1 AS x", "SELECT 1 AS x") is False
+
+        deadline(15.0)
+        monkeypatch.setattr(ex_mod, "_symmetric_difference_sql", real_sql)
+        assert executor._results_equal("SELECT 1 AS x", "SELECT 1 AS x") is True

@@ -17,22 +17,22 @@ import contextlib
 import os
 import re
 import shutil
+import string
 import tempfile
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import duckdb
 
 _instance: Optional["QueryExecutor"] = None
 _lock = threading.Lock()
 
-# Result sets larger than this are never pulled into Python: the row count and
-# the correctness check are computed inside DuckDB instead. `SELECT * FROM
-# events` is a million rows, and materializing that (three times, for the
-# timing median) both dominated the measurement and held the whole result in
-# memory. The cap matches the threshold `compare()` already used to pick the
-# precise row-by-row comparison, so behaviour for small results is unchanged.
+# Result sets larger than this are never pulled into Python: the row count is
+# computed inside DuckDB instead. `SELECT * FROM events` is a million rows, and
+# materializing that (three times, for the timing median) both dominated the
+# measurement and held the whole result in memory. Correctness does not depend
+# on this cap: `compare()` checks every result size inside DuckDB the same way.
 _MAX_MATERIALIZED_ROWS = 50_000
 # An `EXPLAIN ANALYZE` plan is a couple of rows; this only exists so the plan
 # fetch can never become an unbounded materialization of agent-chosen data.
@@ -74,13 +74,20 @@ _QUERY_TIMEOUT_S = 15.0
 _TIMEOUT_ERROR = (
     f"Query cancelled: exceeded the {_QUERY_TIMEOUT_S:.0f}s execution limit"
 )
+# An interrupt sent to an idle connection is not remembered, so once a deadline
+# has expired it is re-sent at this interval until the deadline is released.
+_INTERRUPT_RETRY_S = 0.01
+# Output column names compare case-insensitively the way DuckDB identifiers do,
+# which folds ASCII letters only (`X` matches `x`, `Ä` does not match `ä`).
+# `str.lower()` and `str.casefold()` fold far more than that.
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
 def _strip_terminators(query: str) -> str:
     """Trim surrounding whitespace and any trailing semicolons.
 
     Trailing ``;`` breaks queries that are wrapped in a subquery
-    (``SELECT COUNT(*) FROM (<query>) t``) for correctness checksums.
+    (``SELECT COUNT(*) FROM (<query>) t``) or a CTE for the correctness check.
     """
     return query.strip().rstrip(";").strip()
 
@@ -93,6 +100,33 @@ def _as_subquery(query: str, select: str) -> str:
     parse error, which used to cost the checksum its result.
     """
     return f"SELECT {select} FROM (\n{query}\n) t"
+
+
+def _symmetric_difference_sql(original: str, optimized: str) -> str:
+    """Build a query counting the rows that differ between two queries.
+
+    Rows are compared as a multiset: order is ignored, duplicate multiplicity
+    counts. Each operand is a ``MATERIALIZED`` CTE, so it is evaluated once and
+    both ``EXCEPT ALL`` arms read the same result. The CTE renames duplicate
+    output columns (``x, x`` becomes ``x, x_1``), but set operations match
+    columns by position, so that does not change the outcome.
+
+    Set operations do cast mismatched column types to a common type, which
+    would make ``true`` equal ``1``, so callers must first check that both
+    output schemas are identical. Each query sits on its own lines so that a
+    trailing ``--`` comment cannot swallow the wrapper. The CTE names are not
+    visible to a query run on its own, so a rewrite that refers to them fails
+    the earlier checks instead of reading the original's result.
+    """
+    return (
+        f"WITH __sql_optim_original AS MATERIALIZED (\n{original}\n),\n"
+        f"__sql_optim_optimized AS MATERIALIZED (\n{optimized}\n)\n"
+        "SELECT COUNT(*) FROM (\n"
+        "    (FROM __sql_optim_original EXCEPT ALL FROM __sql_optim_optimized)\n"
+        "    UNION ALL\n"
+        "    (FROM __sql_optim_optimized EXCEPT ALL FROM __sql_optim_original)\n"
+        ") differing"
+    )
 
 
 def _single_statement_error(query: str) -> Optional[str]:
@@ -276,14 +310,19 @@ class QueryExecutor:
         deadline set around a whole measurement still cancels the individual
         statement that a helper is running underneath it.
         """
-        target = self._sessions[-1] if self._sessions else self.conn
+        # Read once: the owning thread can pop the last session between an
+        # emptiness check and the index.
+        try:
+            target = self._sessions[-1]
+        except IndexError:
+            target = self.conn
         try:
             target.interrupt()
         except Exception:
             pass
 
     @contextlib.contextmanager
-    def _deadline(self) -> Iterator[None]:
+    def _deadline(self) -> Iterator[Callable[[], bool]]:
         """Cancel whatever is running on the connection after the time limit.
 
         DuckDB has no statement timeout, but ``interrupt()`` cancels the running
@@ -292,37 +331,55 @@ class QueryExecutor:
 
         Armed by every helper that executes agent SQL *and* around the whole of
         ``_run``, so a helper is bounded whoever calls it while the measurement
-        as a whole is bounded too. Nesting is harmless: each level cancels its
-        own timer, and the earliest one to fire wins.
+        as a whole is bounded too. Nesting is harmless: each level stops its
+        own watchdog, and the earliest one to expire wins.
 
         Must be entered while already holding ``_exec_lock`` — every call site
         does, as ``with self._exec_lock, self._deadline():``. That ordering is
-        what makes the unavoidable cancel race benign: the timer can fire in the
-        window between the statement finishing and ``cancel()`` landing. Join
-        the timer before releasing the lock so an already-started callback
-        cannot target a later session. With the lock held, no other
+        what makes the unavoidable cancel race benign: the watchdog can fire in
+        the window between the statement finishing and the context exiting. It
+        is joined before the lock is released, so an interrupt already in
+        flight cannot target a later session. With the lock held, no other
         session can have a query in flight, so the stray ``interrupt()`` lands on
         an idle connection and does nothing.
 
         Callers must not treat the interrupt as a reason to try a different
-        strategy: the timer has already fired, so a retry would run unbounded.
+        strategy: the deadline has already expired.
+
+        An interrupt that reaches an idle connection is not remembered, so a
+        single one is not enough for a caller that runs several statements:
+        expiring in the gap between two of them would let the next one run
+        unbounded. Once expired, the watchdog therefore keeps re-sending the
+        interrupt until the context exits. It also yields an ``expired()``
+        check, which multi-statement callers use before each stage and before
+        trusting a result, since a statement can complete just as the deadline
+        passes.
         """
-        timer = threading.Timer(_QUERY_TIMEOUT_S, self._interrupt_active)
-        timer.daemon = True
-        timer.start()
+        expires = time.monotonic() + _QUERY_TIMEOUT_S
+        released = threading.Event()
+
+        def watchdog() -> None:
+            if released.wait(_QUERY_TIMEOUT_S):
+                return
+            while not released.is_set():
+                self._interrupt_active()
+                released.wait(_INTERRUPT_RETRY_S)
+
+        thread = threading.Thread(target=watchdog, daemon=True)
+        thread.start()
         try:
-            yield
+            yield lambda: time.monotonic() >= expires
         finally:
-            timer.cancel()
-            timer.join()
+            released.set()
+            thread.join()
 
     def _probe(self, query: str) -> Tuple[Optional[List], Optional[str]]:
         """
         Fetch at most ``_MAX_MATERIALIZED_ROWS`` rows of *query*.
 
         Returns (rows, error). ``rows`` is None when the result set is larger
-        than the cap — the caller then works from the in-engine row count and
-        checksum instead of holding the full result in Python.
+        than the cap — the caller then works from the in-engine row count
+        instead of holding the full result in Python.
 
         This is also the authoritative error check: the query runs unwrapped on
         the read-only connection, so a write (DDL/DML, inside a CTE, or after a
@@ -482,44 +539,71 @@ class QueryExecutor:
 
         return median_ms, row_count, rows, None
 
-    def _checksum(
-        self, query: str
-    ) -> Tuple[Optional[int], Optional[int], Optional[str]]:
-        """
-        Compute a deterministic (row-order-independent) checksum.
-        Returns (row_count, checksum, error).
+    @staticmethod
+    def _output_schema(
+        cur: duckdb.DuckDBPyConnection, query: str
+    ) -> List[Tuple[str, str]]:
+        """Return the output columns of *query* as (name, type) pairs, in order.
 
-        SUM preserves duplicate multiplicity while remaining order-independent.
-        Falls back to count-only if the DuckDB version doesn't support the
-        function, but not past the shared deadline: once a strategy has timed
-        out, the cheaper ones would time out too.
+        ``DESCRIBE <query>`` binds the query without running it, so it is cheap
+        however expensive the query is, and it reports the names the query
+        itself produces. Describing a wrapper such as ``SELECT * FROM (<query>)``
+        would not do: the wrapper deduplicates ``SELECT 1 x, 2 x`` into
+        ``(x, x_1)``, which would make it look identical to ``SELECT 1 x, 2 x_1``.
+
+        Names are folded with ASCII-only case folding. Type strings are kept
+        exactly as DuckDB prints them, which already canonicalizes aliases
+        (``INT4`` is reported as ``INTEGER``, including inside nested types) but
+        keeps the case of struct field names and decimal precision and scale.
         """
-        with self._exec_lock, self._session() as cur, self._deadline():
-            # One session spans every fallback strategy, so they share the
-            # deadline as before and a strategy that errors leaves nothing
-            # behind for the next one.
-            # Sum row hashes so repeated pairs cannot cancel each other.
-            selects = [
-                # Option 1: sum of md5 prefix cast to integer
-                (
-                    "COUNT(*) AS cnt, SUM(CAST(('0x' || "
-                    "LEFT(md5(CAST(t AS VARCHAR)), 15)) AS UBIGINT)) AS chk"
-                ),
-                # Option 2: sum of hash (order-independent since sum is commutative)
-                "COUNT(*) AS cnt, SUM(hash(CAST(t AS VARCHAR)) % 9999999999) AS chk",
-                # Final fallback: count only
-                "COUNT(*) AS cnt, NULL AS chk",
-            ]
-            error: Optional[str] = None
-            for select in selects:
-                try:
-                    result = cur.execute(_as_subquery(query, select)).fetchone()
-                    return result[0], result[1], None
-                except duckdb.InterruptException:
-                    return None, None, _TIMEOUT_ERROR
-                except Exception as exc:
-                    error = str(exc)
-            return None, None, error
+        return [
+            (name.translate(_ASCII_LOWER), column_type)
+            for name, column_type, *_ in cur.execute(f"DESCRIBE {query}").fetchall()
+        ]
+
+    def _results_equal(self, original: str, optimized: str) -> bool:
+        """Return whether two queries produce the same result.
+
+        The equality rule, the same for every result size, empty results
+        included:
+
+        - Same output schema, compared by position: the same number of columns,
+          the same names (ASCII case-insensitive) and identical DuckDB types.
+        - The same rows as a multiset: row order is ignored, duplicate
+          multiplicity is not. Values are compared with DuckDB's own equality,
+          with no float tolerance, so ``-0.0`` equals ``0.0``, ``NaN`` equals
+          ``NaN`` and ``NULL`` equals ``NULL``. Engine equality is not byte
+          identity: ``INTERVAL '1 month'`` equals ``INTERVAL '30 days'``.
+
+        The schema check comes first because it is what keeps the set operation
+        from coercing values: without it ``true`` would equal ``1`` and a
+        ``BIGINT`` would equal a ``DOUBLE`` that cannot represent it. Only the
+        count of differing rows comes back to Python.
+
+        Schema inspection and comparison share one session, lock and deadline,
+        and the deadline is checked before each stage and before a match is
+        reported. Any error or timeout is a mismatch with no fallback: a result
+        that cannot be verified earns no correctness credit. This compares fresh
+        executions of both queries, so it does not establish equivalence for
+        volatile queries such as ones using ``random()``.
+        """
+        if _single_statement_error(original) or _single_statement_error(optimized):
+            return False
+        try:
+            with self._exec_lock, self._session() as cur, self._deadline() as expired:
+                schemas = []
+                for query in (original, optimized):
+                    if expired():
+                        return False
+                    schemas.append(self._output_schema(cur, query))
+                if schemas[0] != schemas[1] or expired():
+                    return False
+                sql = _symmetric_difference_sql(original, optimized)
+                differing = cur.execute(sql).fetchone()[0]
+                return differing == 0 and not expired()
+        except Exception:
+            # Includes `duckdb.InterruptException`.
+            return False
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -533,57 +617,28 @@ class QueryExecutor:
           original_error, optimized_error, verdict
         """
         # Normalize (drop trailing ``;``) so both direct execution and the
-        # subquery-wrapped checksum are valid.
+        # wrapped correctness check are valid.
         original = _strip_terminators(original)
         optimized = _strip_terminators(optimized)
 
-        orig_ms, orig_count, orig_rows, orig_err = self._run(original)
+        orig_ms, orig_count, _, orig_err = self._run(original)
 
         # The optimized query is agent-authored, but the read-only connection is
         # the guarantee: any write (DDL/DML, in a CTE, or after a `;`) is rejected
         # by the DuckDB engine and surfaces as `optimized_error`. No structural
         # pre-check is needed, which also avoids false rejections of valid
         # rewrites (leading comments, a `;` inside a string literal, etc.).
-        opt_ms, opt_count, opt_rows, opt_err = self._run(optimized)
+        opt_ms, opt_count, _, opt_err = self._run(optimized)
 
         # ── Correctness: do both queries return the same data? ────────
-        # Use a DuckDB-level checksum (order-independent) to avoid
-        # false negatives from non-deterministic row ordering in parallel
-        # window function queries on large tables.
-        results_match = False
-        if orig_err is None and opt_err is None:
-            try:
-                if orig_count != opt_count:
-                    results_match = False
-                elif orig_count == 0:
-                    results_match = True
-                elif orig_rows is not None and opt_rows is not None:
-                    # Small/medium: full sorted comparison (precise). Equal row
-                    # counts mean both sides are on the same side of the
-                    # materialization cap, so either both rows are present or
-                    # neither is.
-                    orig_s = sorted(str(r) for r in orig_rows)
-                    opt_s = sorted(str(r) for r in opt_rows)
-                    results_match = orig_s == opt_s
-                else:
-                    # Large result sets: use SQL-level hash checksum
-                    # (deterministic regardless of row ordering / thread count)
-                    o_cnt, o_chk, o_err2 = self._checksum(original)
-                    p_cnt, p_chk, p_err2 = self._checksum(optimized)
-                    if o_err2 or p_err2 or o_chk is None or p_chk is None:
-                        # No usable checksum. Equal row counts alone are NOT
-                        # evidence of equal data on a result set this large, and
-                        # treating them as a match handed out full correctness
-                        # credit (and with it the speedup slice) for a rewrite
-                        # that returned different rows. Withhold the credit
-                        # instead of guessing.
-                        results_match = False
-                    else:
-                        results_match = (o_cnt == p_cnt) and (o_chk == p_chk)
-            except Exception:
-                # Same reasoning as the missing-checksum case: an unverifiable
-                # comparison earns no correctness credit.
-                results_match = False
+        # Different row counts settle it. Otherwise the exact comparison decides,
+        # for empty results too, since those still need matching schemas.
+        results_match = (
+            orig_err is None
+            and opt_err is None
+            and orig_count == opt_count
+            and self._results_equal(original, optimized)
+        )
 
         # ── Speedup ratio ─────────────────────────────────────────────
         speedup = 1.0
