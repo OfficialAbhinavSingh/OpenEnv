@@ -84,12 +84,25 @@ _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
 def _strip_terminators(query: str) -> str:
-    """Trim surrounding whitespace and any trailing semicolons.
+    """Remove trailing terminator tokens without changing comments or quoted SQL.
 
-    Trailing ``;`` breaks queries that are wrapped in a subquery
-    (``SELECT COUNT(*) FROM (<query>) t``) or a CTE for the correctness check.
+    DuckDB's tokenizer skips comments and reports UTF-8 byte offsets. Replace
+    only trailing semicolon tokens with spaces so queries remain embeddable
+    even when comments follow the terminator. Interior statement separators
+    stay intact for the single-statement validation to reject.
     """
-    return query.strip().rstrip(";").strip()
+    query = query.strip()
+    try:
+        tokens = duckdb.tokenize(query)
+    except Exception:
+        # Leave malformed SQL for the normal validation/error reporting path.
+        return query
+    sql = bytearray(query, "utf-8")
+    for position, token_type in reversed(tokens):
+        if token_type != duckdb.token_type.operator or sql[position] != ord(";"):
+            break
+        sql[position] = ord(" ")
+    return sql.decode("utf-8")
 
 
 def _as_subquery(query: str, select: str) -> str:

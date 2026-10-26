@@ -803,6 +803,62 @@ class TestSingleStatement:
     way an earlier keyword pre-check did.
     """
 
+    @pytest.mark.parametrize("rows", [0, 2, 50_002])
+    @pytest.mark.parametrize(
+        "suffix",
+        [
+            "; -- trailing comment",
+            "; /* trailing block */",
+            " /* before */; /* outer /* nested ; */ comment */ -- end",
+            "; -- first terminator\n; /* second */;",
+        ],
+    )
+    def test_commented_terminators_preserve_correctness(self, executor, rows, suffix):
+        query = f"SELECT i AS x FROM range({rows}) t(i)"
+        result = executor.compare(query + suffix, query + suffix)
+        assert result["original_error"] is None
+        assert result["optimized_error"] is None
+        assert result["original_rows"] == result["optimized_rows"] == rows
+        assert result["results_match"] is True
+        assert executor.compare(query, query + suffix)["results_match"] is True
+        assert executor.compare(query, query + " WHERE false" + suffix)[
+            "results_match"
+        ] is (rows == 0)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 'Ä; -- /* quoted */' AS \"é;--\"",
+            "SELECT 'it''s; /* quoted */' AS \"a\"\";b\"",
+            "SELECT $$; -- dollar quoted /* text */$$ AS x",
+            "SELECT $tag$é; -- text$tag$ AS x",
+            "/* leading ; */ SELECT 1 /* embedded ; */ AS x -- final ;",
+        ],
+    )
+    def test_terminator_normalization_preserves_sql_text(self, executor, query):
+        from envs.sql_optim_env.server.executor import _strip_terminators
+
+        suffix = "\n; /* trailing ; */ -- final ;"
+        assert _strip_terminators(query + suffix) == query + suffix.replace(
+            "\n;", "\n ", 1
+        )
+        assert executor.compare(query, query + suffix)["results_match"] is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT 1 AS x; /* comment */ SELECT 1 AS x; -- end",
+            "SELECT 1 AS x; -- comment\nSELECT 1 AS x; /* end */",
+            "SELECT 'unterminated; -- comment",
+            "SELECT 1 AS x; /* unterminated",
+            "; /* comment only */ -- end",
+        ],
+    )
+    def test_normalization_does_not_hide_invalid_statements(self, executor, query):
+        result = executor.compare("SELECT 1 AS x", query)
+        assert result["optimized_error"] is not None
+        assert result["results_match"] is False
+
     def test_a_second_statement_is_rejected(self, executor):
         info = executor.compare(
             "SELECT id FROM events WHERE user_id = 42",
