@@ -296,8 +296,9 @@ class QueryExecutor:
         Must be entered while already holding ``_exec_lock`` — every call site
         does, as ``with self._exec_lock, self._deadline():``. That ordering is
         what makes the unavoidable cancel race benign: the timer can fire in the
-        window between the statement finishing and ``cancel()`` landing, but
-        because the lock is only released *after* this context exits, no other
+        window between the statement finishing and ``cancel()`` landing. Join
+        the timer before releasing the lock so an already-started callback
+        cannot target a later session. With the lock held, no other
         session can have a query in flight, so the stray ``interrupt()`` lands on
         an idle connection and does nothing.
 
@@ -311,6 +312,7 @@ class QueryExecutor:
             yield
         finally:
             timer.cancel()
+            timer.join()
 
     def _probe(self, query: str) -> Tuple[Optional[List], Optional[str]]:
         """
@@ -485,7 +487,7 @@ class QueryExecutor:
         Compute a deterministic (row-order-independent) checksum.
         Returns (row_count, checksum, error).
 
-        BIT_XOR is commutative+associative — order-independent fingerprint.
+        SUM preserves duplicate multiplicity while remaining order-independent.
         Falls back to count-only if the DuckDB version doesn't support the
         function, but not past the shared deadline: once a strategy has timed
         out, the cheaper ones would time out too.
@@ -494,11 +496,11 @@ class QueryExecutor:
             # One session spans every fallback strategy, so they share the
             # deadline as before and a strategy that errors leaves nothing
             # behind for the next one.
-            # Try BIT_XOR of a numeric hash (portable across DuckDB versions)
+            # Sum row hashes so repeated pairs cannot cancel each other.
             selects = [
-                # Option 1: BIT_XOR of md5 prefix cast to integer
+                # Option 1: sum of md5 prefix cast to integer
                 (
-                    "COUNT(*) AS cnt, BIT_XOR(CAST(('0x' || "
+                    "COUNT(*) AS cnt, SUM(CAST(('0x' || "
                     "LEFT(md5(CAST(t AS VARCHAR)), 15)) AS UBIGINT)) AS chk"
                 ),
                 # Option 2: sum of hash (order-independent since sum is commutative)

@@ -424,6 +424,16 @@ class UpstreamPool:
                 ) in self._by_engine.items()
             ]
 
+    def forget(self, upstream: Upstream) -> None:
+        """Drop the cached client for `upstream`, and with it the credential it holds.
+
+        Every proxied call resolves its session's engine here, so the next call naming this engine
+        probes it again. Call it only once no session uses the engine: for a caller whose key should
+        not outlive their use of it.
+        """
+        with self._lock:
+            self._by_engine.pop(upstream.cache_key, None)
+
     async def resolve(self, upstream: Upstream) -> tuple[InferenceClient, str]:
         """Client and measured capture level for `upstream`, probing once per engine."""
         key = upstream.cache_key
@@ -572,7 +582,7 @@ def create_app(
             from this app is an eval rollout.
         admin_key (`str`, *optional*):
             Required by the session-management routes when set. Leave unset for a private port; set it
-            whenever this app is reachable from outside, which `serve` does automatically.
+            whenever this app is reachable from outside, which `serve` and `rollout` do automatically.
         max_model_calls (`int`, *optional*, defaults to `0`):
             Default ceiling on model calls per session; `0` is unlimited, and a session may name its
             own. Once a rollout reaches it the proxy answers a terminal completion itself, which ends
@@ -655,7 +665,7 @@ def create_app(
         return session.capture_level or app.state.capture_level
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
+    async def health(request: Request) -> dict[str, Any]:
         return {
             "status": "ok",
             "instance": app.state.instance_id,
@@ -669,9 +679,10 @@ def create_app(
             # readable from an endpoint that, on a Space, is public.
             "capture_level": app.state.capture_level,
             "rollout_type": "train" if app.state.capture_level == "tokens" else "eval",
-            # Engines named per session and already probed. A caller can see what this server
-            # measured without minting a session to find out.
-            "upstreams": app.state.upstreams.known(),
+            # Engines named per session and already probed, so a caller can see what this server
+            # measured without minting a session. Behind the admin key when one is set: on a public
+            # Space these are other callers' endpoints, private tunnel URLs among them.
+            "upstreams": app.state.upstreams.known() if _admin_ok(request) else [],
             "upstream_auth": bool(app.state.inference and app.state.inference.api_key),
             "param_fixes": (
                 [str(f) for f in app.state.inference.param_fixes]
@@ -1348,6 +1359,14 @@ def create_app(
     return app
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Whether `host` is a loopback-only bind (private local port).
+
+    `0.0.0.0` / `::` are intentionally not loopback: they publish on every interface.
+    """
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1366,7 +1385,12 @@ def main() -> None:
         "upstream may be a hosted provider, and reporting one of these two when it is not says "
         "something untrue about capture.",
     )
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default: 127.0.0.1). Non-loopback binds require --admin-key or "
+        "$OPENENV_CAPTURE_ADMIN_KEY so /sessions* is never left open on a reachable interface.",
+    )
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument(
         "--max-output-tokens",
@@ -1398,6 +1422,12 @@ def main() -> None:
         help="what the upstream can return. Probed from the endpoint when omitted, which is the "
         "recommended path; pass it only to force a level.",
     )
+    parser.add_argument(
+        "--admin-key",
+        default=os.environ.get("OPENENV_CAPTURE_ADMIN_KEY", ""),
+        help="key the session-management routes (/sessions*) require (defaults to "
+        "$OPENENV_CAPTURE_ADMIN_KEY). Required for non-loopback binds. Never printed or logged.",
+    )
     args = parser.parse_args()
 
     import uvicorn
@@ -1423,6 +1453,16 @@ def main() -> None:
         for fix in report.param_fixes:
             print(f"  upstream compat: {fix}")
 
+    # Flag/env only — never mint-and-print (that would log a credential). Loopback may leave the
+    # key unset for private local use; non-loopback must supply one explicitly.
+    admin_key = args.admin_key or None
+    if not admin_key and not _is_loopback_host(args.host):
+        raise SystemExit(
+            f"--admin-key or $OPENENV_CAPTURE_ADMIN_KEY is required when --host={args.host} "
+            "(non-loopback bind would publish /sessions* ungated). "
+            "Pass --host 127.0.0.1 for a private local port, or set a key."
+        )
+
     uvicorn.run(
         create_app(
             llm_url=args.llm_url,
@@ -1433,6 +1473,7 @@ def main() -> None:
             api_key=args.api_key or None,
             auth_header=args.auth_header,
             capture_level=level,
+            admin_key=admin_key,
         ),
         host=args.host,
         port=args.port,

@@ -808,3 +808,46 @@ class TestSingleStatement:
         info = executor.compare("SELECT id FROM events WHERE user_id = 42", query)
 
         assert info["optimized_error"] is None
+
+
+@pytest.mark.parametrize("value", [1, 2])
+def test_large_result_checksum_preserves_duplicate_multiplicity(executor, value):
+    original = "SELECT 1 AS x FROM range(50002)"
+    rewritten = f"SELECT {value} AS x FROM range(50002)"
+    result = executor.compare(original, rewritten)
+    assert result["original_error"] is None
+    assert result["optimized_error"] is None
+    assert result["results_match"] is (value == 1)
+
+
+def test_expired_deadline_finishes_before_releasing_execution_lock(
+    executor, monkeypatch
+):
+    import threading
+
+    from envs.sql_optim_env.server import executor as module
+
+    fired = threading.Event()
+    finish_interrupt = threading.Event()
+    released = threading.Event()
+
+    def delayed_interrupt():
+        fired.set()
+        finish_interrupt.wait(5)
+
+    def run():
+        with executor._exec_lock, executor._deadline():
+            assert fired.wait(2)
+        released.set()
+
+    monkeypatch.setattr(module, "_QUERY_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(executor, "_interrupt_active", delayed_interrupt)
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert fired.wait(2)
+        assert not released.wait(0.1)
+    finally:
+        finish_interrupt.set()
+        worker.join(2)
+    assert released.is_set()
